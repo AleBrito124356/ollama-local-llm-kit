@@ -1,0 +1,89 @@
+# Curated local models for Ollama, tuned for consumer GPUs.
+#
+# Sizes are the download size of the default quantization Ollama pulls (Q4_K_M
+# for most chat models). "min_vram_gb" is the amount of GPU memory needed to keep
+# the whole model on the GPU at a small context; on less VRAM Ollama offloads the
+# rest to system RAM and runs slower but still works. Pull a model with:
+#
+#     python -m src.model_manager pull llama3.1:8b
+#
+# On an RTX 5070 (12 GB) the 3B and 8B chat models fit entirely in VRAM; a 14B
+# Q4 model fits with a modest context window. See docs/gpu-notes.md for details.
+
+chat:
+  - name: llama3.2:3b
+    params: "3B"
+    size_gb: 2.0
+    min_vram_gb: 4
+    min_ram_gb: 8
+    quant: Q4_K_M
+    tools: true
+    note: Fastest chat model. Runs on almost any GPU or CPU-only. Good default for laptops.
+  - name: llama3.1:8b
+    params: "8B"
+    size_gb: 4.7
+    min_vram_gb: 6
+    min_ram_gb: 16
+    quant: Q4_K_M
+    tools: true
+    note: Best all-round local chat and tool-calling model for an 8-12 GB GPU. The kit default.
+  - name: qwen2.5:7b
+    params: "7B"
+    size_gb: 4.7
+    min_vram_gb: 6
+    min_ram_gb: 16
+    quant: Q4_K_M
+    tools: true
+    note: Strong reasoning and coding for its size. Solid alternative to llama3.1:8b.
+  - name: qwen2.5:14b
+    params: "14B"
+    size_gb: 9.0
+    min_vram_gb: 11
+    min_ram_gb: 24
+    quant: Q4_K_M
+    tools: true
+    note: Noticeably smarter. Fits an RTX 5070 12 GB at a reduced context window.
+  - name: phi3.5:3.8b
+    params: "3.8B"
+    size_gb: 2.2
+    min_vram_gb: 4
+    min_ram_gb: 8
+    quant: Q4_K_M
+    tools: false
+    note: Microsoft Phi-3.5. Punches above its weight on reasoning; great on tight VRAM.
+
+embed:
+  - name: nomic-embed-text
+    params: "137M"
+    size_gb: 0.27
+    min_vram_gb: 2
+    min_ram_gb: 4
+    quant: F16
+    tools: false
+    note: The embedding model used by the local RAG demo. Small, fast, high quality.
+  - name: mxbai-embed-large
+    params: "335M"
+    size_gb: 0.67
+    min_vram_gb: 2
+    min_ram_gb: 4
+    quant: F16
+    tools: false
+    note: Larger embeddings when you want a little more retrieval accuracy.
+
+vision:
+  - name: llava:7b
+    params: "7B"
+    size_gb: 4.7
+    min_vram_gb: 6
+    min_ram_gb: 16
+    quant: Q4_0
+    tools: false
+    note: Image understanding. Used by examples/vision.py. Ask questions about a picture.
+  - name: llama3.2-vision:11b
+    params: "11B"
+    size_gb: 7.9
+    min_vram_gb: 10
+    min_ram_gb: 24
+    quant: Q4_K_M
+    tools: false
+    note: Sharper vision model. Fits a 12 GB GPU at a small context window.

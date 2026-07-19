@@ -1,0 +1,27 @@
+# Environment and secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# RAG vector cache (regenerated from sample_docs/)
+.rag_cache.npz
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

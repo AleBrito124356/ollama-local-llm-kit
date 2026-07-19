@@ -1,0 +1,23 @@
+# Core: OpenAI SDK talks to both Ollama (/v1) and NVIDIA NIM unchanged.
+openai>=1.30.0
+
+# Ollama native REST API (pull progress, tags, show, delete) and NIM signup flow.
+requests>=2.31.0
+
+# Local vector store math for the RAG demo.
+numpy>=1.26.0
+
+# Curated model catalog (models.yaml).
+pyyaml>=6.0
+
+# Pretty tables, progress bars and REPL output.
+rich>=13.7.0
+
+# Load configuration from .env.
+python-dotenv>=1.0.0
+
+# Validate structured-output extraction into typed objects.
+pydantic>=2.6.0
+
+# Only used by examples/vision.py to draw a sample image when none is provided.
+pillow>=10.2.0
