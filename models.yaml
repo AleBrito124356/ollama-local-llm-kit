@@ -1,14 +1,20 @@
-# Curated local models for Ollama, tuned for consumer GPUs.
+# Curated local models for Ollama, with the data the fit planner needs.
 #
-# Sizes are the download size of the default quantization Ollama pulls (Q4_K_M
-# for most chat models). "min_vram_gb" is the amount of GPU memory needed to keep
-# the whole model on the GPU at a small context; on less VRAM Ollama offloads the
-# rest to system RAM and runs slower but still works. Pull a model with:
+# size_gb        download size of the default quantization Ollama pulls, in GB
+#                (10^9 bytes, the unit `ollama list` uses). GGUF weights load as-is,
+#                so this is also the weights' memory footprint.
+# min_vram_gb    rough VRAM to keep the whole model on the GPU at a small context.
+# n_layers, n_kv_heads, head_dim
+#                transformer shape, used to size the KV cache:
+#                2 x n_layers x n_kv_heads x head_dim x 2 bytes per token of context.
+# context_length the model's trained context window.
 #
-#     python -m src.model_manager pull llama3.1:8b
+# Plan against your own hardware (auto-detected, or pass --vram / --ram):
 #
-# On an RTX 5070 (12 GB) the 3B and 8B chat models fit entirely in VRAM; a 14B
-# Q4 model fits with a modest context window. See docs/gpu-notes.md for details.
+#     python -m src.model_manager fit --ctx 8192
+#     python -m src.model_manager recommend
+#
+# Pull a model with:  python -m src.model_manager pull llama3.1:8b
 
 chat:
   - name: llama3.2:3b
@@ -18,14 +24,22 @@ chat:
     min_ram_gb: 8
     quant: Q4_K_M
     tools: true
+    n_layers: 28
+    n_kv_heads: 8
+    head_dim: 128
+    context_length: 131072
     note: Fastest chat model. Runs on almost any GPU or CPU-only. Good default for laptops.
   - name: llama3.1:8b
     params: "8B"
-    size_gb: 4.7
+    size_gb: 4.9
     min_vram_gb: 6
     min_ram_gb: 16
     quant: Q4_K_M
     tools: true
+    n_layers: 32
+    n_kv_heads: 8
+    head_dim: 128
+    context_length: 131072
     note: Best all-round local chat and tool-calling model for an 8-12 GB GPU. The kit default.
   - name: qwen2.5:7b
     params: "7B"
@@ -34,7 +48,11 @@ chat:
     min_ram_gb: 16
     quant: Q4_K_M
     tools: true
-    note: Strong reasoning and coding for its size. Solid alternative to llama3.1:8b.
+    n_layers: 28
+    n_kv_heads: 4
+    head_dim: 128
+    context_length: 32768
+    note: Strong reasoning and coding for its size. Small KV cache (4 KV heads), so long contexts are cheap.
   - name: qwen2.5:14b
     params: "14B"
     size_gb: 9.0
@@ -42,7 +60,11 @@ chat:
     min_ram_gb: 24
     quant: Q4_K_M
     tools: true
-    note: Noticeably smarter. Fits an RTX 5070 12 GB at a reduced context window.
+    n_layers: 48
+    n_kv_heads: 8
+    head_dim: 128
+    context_length: 32768
+    note: Noticeably smarter. On a 12 GB GPU it fits only with a reduced context window.
   - name: phi3.5:3.8b
     params: "3.8B"
     size_gb: 2.2
@@ -50,7 +72,11 @@ chat:
     min_ram_gb: 8
     quant: Q4_K_M
     tools: false
-    note: Microsoft Phi-3.5. Punches above its weight on reasoning; great on tight VRAM.
+    n_layers: 32
+    n_kv_heads: 32
+    head_dim: 96
+    context_length: 131072
+    note: Punches above its weight on reasoning, but no grouped-query attention, so its KV cache is large.
 
 embed:
   - name: nomic-embed-text
@@ -78,6 +104,10 @@ vision:
     min_ram_gb: 16
     quant: Q4_0
     tools: false
+    n_layers: 32
+    n_kv_heads: 8
+    head_dim: 128
+    context_length: 32768
     note: Image understanding. Used by examples/vision.py. Ask questions about a picture.
   - name: llama3.2-vision:11b
     params: "11B"
@@ -86,4 +116,8 @@ vision:
     min_ram_gb: 24
     quant: Q4_K_M
     tools: false
+    n_layers: 40
+    n_kv_heads: 8
+    head_dim: 128
+    context_length: 131072
     note: Sharper vision model. Fits a 12 GB GPU at a small context window.

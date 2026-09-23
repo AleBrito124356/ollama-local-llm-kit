@@ -15,7 +15,10 @@ Run:
 
 from __future__ import annotations
 
+import ast
 import json
+import math
+import operator
 import os
 import sys
 
@@ -24,16 +27,95 @@ from src.client import LLMClient  # noqa: E402
 
 
 # -- the actual tool implementations --------------------------------------
-def calculate(expression: str) -> str:
-    """Evaluate a basic arithmetic expression safely (no names, no calls)."""
-    allowed = set("0123456789+-*/(). %")
-    if not expression or set(expression) - allowed:
-        return json.dumps({"error": "unsupported characters in expression"})
+# The model writes the expression, so it is untrusted input. It is parsed into a
+# Python AST and walked by hand: only numbers, + - * / // % ** and unary +/- are
+# allowed. No eval, no names, no calls, no attribute access. Size limits stop
+# pathological inputs such as 9**9**9**9 (which never finishes under eval) and
+# results too large to print.
+MAX_EXPRESSION_CHARS = 200
+MAX_NODES = 100
+MAX_RESULT_BITS = 1024          # ints up to ~308 decimal digits
+MAX_FLOAT = 1e300
+
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+class CalcError(ValueError):
+    """The expression is not plain arithmetic or its result is out of bounds."""
+
+
+def _check_size(value):
+    if isinstance(value, int) and value.bit_length() > MAX_RESULT_BITS:
+        raise CalcError("result is too large")
+    if isinstance(value, float) and (math.isinf(value) or math.isnan(value) or abs(value) > MAX_FLOAT):
+        raise CalcError("result is too large")
+    return value
+
+
+def _pow(base, exponent):
+    """``base ** exponent`` without ever computing a result that would be rejected anyway."""
+    magnitude = abs(base)
+    # log2(|result|) = exponent * log2(|base|): reject before doing any work.
+    if magnitude not in (0, 1) and exponent != 0 and math.log2(magnitude) * exponent > MAX_RESULT_BITS:
+        raise CalcError("result is too large")
     try:
-        # eval is constrained to arithmetic only: empty builtins and a char allowlist.
-        value = eval(expression, {"__builtins__": {}}, {})  # noqa: S307
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": str(exc)})
+        result = operator.pow(base, exponent)
+    except OverflowError as exc:
+        raise CalcError("result is too large") from exc
+    if isinstance(result, complex):
+        raise CalcError("complex numbers are not supported")
+    return result
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return _check_size(node.value)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+        return _UNARY_OPS[type(node.op)](_eval_node(node.operand))
+    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+        left, right = _eval_node(node.left), _eval_node(node.right)
+        if isinstance(node.op, ast.Pow):
+            return _check_size(_pow(left, right))
+        return _check_size(_BIN_OPS[type(node.op)](left, right))
+    raise CalcError(f"unsupported syntax: {type(node).__name__}")
+
+
+def safe_eval(expression: str) -> int | float:
+    """Evaluate plain arithmetic, or raise CalcError / ZeroDivisionError."""
+    if not expression or not expression.strip():
+        raise CalcError("empty expression")
+    if len(expression) > MAX_EXPRESSION_CHARS:
+        raise CalcError(f"expression is longer than {MAX_EXPRESSION_CHARS} characters")
+    try:
+        tree = ast.parse(expression.strip(), mode="eval")
+    except SyntaxError as exc:
+        raise CalcError("not a valid arithmetic expression") from exc
+    if sum(1 for _ in ast.walk(tree)) > MAX_NODES:
+        raise CalcError("expression is too complex")
+    return _eval_node(tree)
+
+
+def calculate(expression: str) -> str:
+    """Evaluate a basic arithmetic expression safely; always returns a JSON string."""
+    try:
+        value = safe_eval(expression)
+    except ZeroDivisionError:
+        return json.dumps({"expression": expression, "error": "division by zero"})
+    except (CalcError, RecursionError, MemoryError) as exc:
+        return json.dumps({"expression": expression, "error": str(exc) or "invalid expression"})
+    if isinstance(value, float) and value.is_integer() and abs(value) < 2**53:
+        value = int(value)
     return json.dumps({"expression": expression, "result": value})
 
 
@@ -48,6 +130,23 @@ def get_weather(city: str) -> str:
 
 
 TOOL_IMPLS = {"calculate": calculate, "get_weather": get_weather}
+
+
+def run_tool(name: str, raw_arguments: str | None) -> str:
+    """Run one tool call from the model; any mistake becomes a JSON error the model can read."""
+    impl = TOOL_IMPLS.get(name)
+    if impl is None:
+        return json.dumps({"error": f"unknown tool {name!r}"})
+    try:
+        args = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError:
+        return json.dumps({"error": "tool arguments are not valid JSON"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": "tool arguments must be a JSON object"})
+    try:
+        return impl(**args)
+    except TypeError as exc:  # missing or unexpected argument names
+        return json.dumps({"error": f"bad arguments for {name}: {exc}"})
 
 TOOLS = [
     {
@@ -114,13 +213,8 @@ def run(question: str) -> None:
 
     for tc in tool_calls:
         name = tc.function.name
-        try:
-            args = json.loads(tc.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        impl = TOOL_IMPLS.get(name)
-        result = impl(**args) if impl else json.dumps({"error": f"unknown tool {name}"})
-        print(f"-> {name}({args}) = {result}")
+        result = run_tool(name, tc.function.arguments)
+        print(f"-> {name}({tc.function.arguments}) = {result}")
         messages.append({"role": "tool", "tool_call_id": tc.id, "name": name, "content": result})
 
     # Second round: the model answers using the tool results.
