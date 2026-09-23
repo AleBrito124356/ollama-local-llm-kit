@@ -144,3 +144,14 @@ def test_network_guard_blocks_remote_hosts():
 def test_server_can_run_standalone_on_any_port():
     with FakeOllamaServer(port=0) as server:
         assert requests.get(server.url + "/").text == "Ollama is running"
+
+
+def test_realtime_mode_makes_wall_clock_match_the_metrics(fake):
+    from src import benchmark as bm
+
+    requests.post(fake.url + "/api/chat", json={"model": "llama3.2:3b", "messages": [], "stream": False})  # load
+    fake.state.realtime = True
+    r = bm.bench_ollama("llama3.2:3b", "hi", 20)
+    assert r.decode_tps == pytest.approx(95.0, rel=1e-6)
+    assert 50 < r.e2e_tps < 95  # 20 tokens at ~95 tok/s of wall time, plus a short prefill
+    assert r.total_s >= 19 / 95

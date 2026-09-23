@@ -30,6 +30,10 @@ Fault injection (prefix any model name):
 ``--nim`` switches to a strict NIM-like mode: only NIM model ids, no ``/api``
 routes, ``Authorization: Bearer nvapi-...`` required, and ``input_type`` required
 on the asymmetric embedding model.
+
+``--realtime`` makes streamed replies really take the canned load, prompt and
+per-token times, so client-side figures (first-token latency, end-to-end tok/s)
+agree with the metrics the fake reports. Without it, replies stream instantly.
 """
 
 from __future__ import annotations
@@ -208,10 +212,14 @@ PULLABLE = {
 class FakeState:
     """Mutable server state plus the request log tests read."""
 
-    def __init__(self, nim: bool = False, first_token_delay_s: float = 0.0, token_delay_s: float = 0.0):
+    def __init__(self, nim: bool = False, first_token_delay_s: float = 0.0, token_delay_s: float = 0.0,
+                 realtime: bool = False):
         self.nim = nim
         self.first_token_delay_s = first_token_delay_s
         self.token_delay_s = token_delay_s
+        # realtime: really wait for the canned load, prefill and per-token decode times,
+        # so client-side timings (TTFT, end-to-end tok/s) agree with the reported metrics.
+        self.realtime = realtime
         self.lock = threading.Lock()
         self.models: dict[str, FakeModel] = {}
         self.loaded: dict[str, dict] = {}
@@ -258,7 +266,7 @@ OOM_MESSAGE = "model requires more system memory (11.2 GiB) than is available (7
 
 
 # -- reply generation ------------------------------------------------------------
-_CONTEXT_RE = re.compile(r"^\[(\d+)\] \(([^)]*)\) (.*)$")
+_CONTEXT_RE = re.compile(r"^\[(\d+)\] \(([^)\n]*)\) (.*)$", re.MULTILINE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _ARITH_RE = re.compile(r"[-+(]*\d[\d.]*(?:\s*(?:\*\*|//|[-+*/%])\s*[-+(]*\d[\d.]*\)*)+")
 _PLACE_RE = re.compile(r"\b(?:in|for|at|from)\s+((?:[A-Z][\w'.-]*)(?:\s+[A-Z][\w'.-]*)*)")
@@ -315,25 +323,24 @@ def rag_answer(prompt: str) -> str | None:
     if "Context:" not in prompt or "Question:" not in prompt:
         return None
     question = prompt.rsplit("Question:", 1)[1].split("\n", 1)[0].strip()
-    passages = []
-    for block in prompt.split("\n\n"):
-        m = _CONTEXT_RE.match(block.strip())
-        if m:
-            passages.append((int(m.group(1)), m.group(3)))
+    passages = [(int(m.group(1)), m.group(3)) for m in _CONTEXT_RE.finditer(prompt)]
     if not passages:
         return None
     q_words = set(content_words(question))
     scored = []
     for order, (n, text) in enumerate(passages):
         for pos, sentence in enumerate(_SENTENCE_RE.split(text)):
+            sentence = re.sub(r"^#+ [^.!?]*?(?= [A-Z])", "", sentence.strip()).strip()  # drop a merged heading
             overlap = len(q_words & set(content_words(sentence)))
             if overlap:
-                scored.append((-overlap, order, pos, n, sentence.strip()))
+                # A chunk can start mid-sentence; prefer sentences that start properly.
+                fragment = not sentence[:1].isupper() and not sentence.startswith("`")
+                scored.append((-overlap, fragment, order, pos, n, sentence))
     if not scored:
         return "I do not know: the provided context does not answer the question."
     scored.sort()
     picked, seen = [], set()
-    for _neg, _order, _pos, n, sentence in scored:
+    for _neg, _frag, _order, _pos, n, sentence in scored:
         if sentence in seen:
             continue
         seen.add(sentence)
@@ -714,6 +721,14 @@ class FakeHandler(BaseHTTPRequestHandler):
                 }
         return m.load_s if cold else 0.015
 
+    def _delays(self, before_first_ns: float, decode_tps: float) -> tuple[float, float]:
+        """(sleep before the first token, sleep between tokens) for a streamed reply."""
+        first, between = self.state.first_token_delay_s, self.state.token_delay_s
+        if self.state.realtime:
+            first += before_first_ns / 1e9
+            between += 1.0 / decode_tps
+        return first, between
+
     def h_chat(self, body) -> None:
         fault, name = split_fault(body.get("model", ""))
         m = self.state.find(name)
@@ -731,13 +746,13 @@ class FakeHandler(BaseHTTPRequestHandler):
         limit = options.get("num_predict")
         limit = int(limit) if isinstance(limit, (int, float)) and limit > 0 else None
         load_s = self._load(m, options, body.get("keep_alive"))
+        cpu_slowdown = 0.2 if options.get("num_gpu") == 0 else 1.0
         json_mode = body.get("format") in ("json",) or isinstance(body.get("format"), dict)
         text, calls = compose_reply(m, messages, limit, tools=body.get("tools"), json_mode=json_mode)
         pieces = split_tokens(text)
         done_reason = "stop"
         if limit and len(pieces) >= limit:
             pieces, done_reason = pieces[:limit], "length"
-        cpu_slowdown = 0.2 if options.get("num_gpu") == 0 else 1.0
         eval_count = max(len(pieces), 1)
         prompt_count = prompt_token_count(messages)
         final = {
@@ -768,10 +783,12 @@ class FakeHandler(BaseHTTPRequestHandler):
             self._chunk(json.dumps({"error": OOM_MESSAGE}).encode() + b"\n")
             self._end_stream()
             return
-        time.sleep(self.state.first_token_delay_s)
+        first_delay, token_delay = self._delays(final["load_duration"] + final["prompt_eval_duration"],
+                                                m.decode_tps * cpu_slowdown)
+        time.sleep(first_delay)
         for i, piece in enumerate(pieces):
             if i:
-                time.sleep(self.state.token_delay_s)
+                time.sleep(token_delay)
             event = {"model": m.name, "created_at": "2026-09-01T12:00:00Z",
                      "message": {"role": "assistant", "content": piece}, "done": False}
             self._chunk(json.dumps(event).encode() + b"\n")
@@ -803,8 +820,7 @@ class FakeHandler(BaseHTTPRequestHandler):
         messages = body.get("messages") or []
         limit = body.get("max_tokens") or body.get("max_completion_tokens")
         limit = int(limit) if isinstance(limit, (int, float)) and limit > 0 else None
-        if not self.state.nim:
-            self._load(m, {}, body.get("keep_alive"))
+        load_s = 0.0 if self.state.nim else self._load(m, {}, body.get("keep_alive"))
         json_mode = (body.get("response_format") or {}).get("type") in ("json_object", "json_schema")
         text, calls = compose_reply(m, messages, limit, tools=body.get("tools"), json_mode=json_mode)
         pieces = split_tokens(text)
@@ -839,10 +855,11 @@ class FakeHandler(BaseHTTPRequestHandler):
             return b"data: " + json.dumps(obj).encode() + b"\n\n"
 
         self._start_stream("text/event-stream")
-        time.sleep(self.state.first_token_delay_s)
+        first_delay, token_delay = self._delays((load_s + prompt_count / m.prefill_tps) * 1e9, m.decode_tps)
+        time.sleep(first_delay)
         for i, piece in enumerate(pieces):
             if i:
-                time.sleep(self.state.token_delay_s)
+                time.sleep(token_delay)
             delta = {"content": piece}
             if i == 0:
                 delta["role"] = "assistant"
@@ -900,8 +917,10 @@ class FakeOllamaServer:
     """Run the fake in a background thread: ``with FakeOllamaServer() as fake: fake.url``."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0, nim: bool = False,
-                 first_token_delay_s: float = 0.0, token_delay_s: float = 0.0, verbose: bool = False):
-        self.state = FakeState(nim=nim, first_token_delay_s=first_token_delay_s, token_delay_s=token_delay_s)
+                 first_token_delay_s: float = 0.0, token_delay_s: float = 0.0, verbose: bool = False,
+                 realtime: bool = False):
+        self.state = FakeState(nim=nim, first_token_delay_s=first_token_delay_s, token_delay_s=token_delay_s,
+                               realtime=realtime)
         self.httpd = _QuietThreadingHTTPServer((host, port), FakeHandler)
         self.httpd.state = self.state  # type: ignore[attr-defined]
         self.httpd.verbose = verbose  # type: ignore[attr-defined]
@@ -932,6 +951,7 @@ class FakeOllamaServer:
         self.state.reset()
         self.state.first_token_delay_s = 0.0
         self.state.token_delay_s = 0.0
+        self.state.realtime = False
 
     def __enter__(self) -> "FakeOllamaServer":
         return self.start()
@@ -947,11 +967,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--nim", action="store_true", help="Strict NVIDIA NIM-like mode")
     parser.add_argument("--ttft-ms", type=float, default=0.0, help="Delay before the first streamed token")
     parser.add_argument("--token-ms", type=float, default=0.0, help="Delay between streamed tokens")
+    parser.add_argument("--realtime", action="store_true",
+                        help="Really wait for the canned load/prefill/decode times, so wall-clock timings match")
     parser.add_argument("--verbose", action="store_true", help="Print an access log line per request")
     args = parser.parse_args(argv)
 
     server = FakeOllamaServer(args.host, args.port, nim=args.nim, first_token_delay_s=args.ttft_ms / 1000,
-                              token_delay_s=args.token_ms / 1000, verbose=args.verbose)
+                              token_delay_s=args.token_ms / 1000, verbose=args.verbose, realtime=args.realtime)
     kind = "NIM-like" if args.nim else "Ollama"
     print(f"Fake {kind} server listening on {server.url}  (Ctrl+C to stop)", flush=True)
     if args.nim:
