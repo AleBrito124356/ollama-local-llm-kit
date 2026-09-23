@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import json
+
 import pytest
 
 from src import benchmark as bm
+from src import hardware as hw
+from src.fake_ollama import prompt_token_count
+
+RTX_5070 = hw.Hardware(gpus=[hw.GPU(0, "NVIDIA GeForce RTX 5070", 12 * 1024, 900)], ram_total_gib=32.0)
+
+
+@pytest.fixture(autouse=True)
+def canned_hardware(monkeypatch):
+    monkeypatch.setattr(bm.hw, "detect", lambda *a, **k: RTX_5070)
 
 
 def test_local_metrics_come_from_ollama(fake):
@@ -104,3 +117,124 @@ def test_cli_end_to_end(fake, capsys):
 def test_cli_unreachable(capsys):
     assert bm.main([]) == 1
     assert "Cannot reach Ollama" in capsys.readouterr().out
+
+
+# -- benchmark v2: warm-up, runs, prefill vs decode, options, exports ------------------------
+def test_warmup_is_excluded_and_runs_are_measured(fake):
+    s = bm.benchmark_model("ollama", "llama3.1:8b", "hello there", 32, runs=3)
+    chats = fake.requests("/api/chat")
+    assert len(chats) == 4  # 1 warm-up + 3 runs
+    prompts = [c["body"]["messages"][0]["content"] for c in chats]
+    assert prompts == [f"[run {i}] hello there" for i in range(4)]  # distinct: no prompt-cache hits
+    assert s.warmup.load_s == pytest.approx(2.1)  # cold load happens in the warm-up...
+    assert all(r.load_s == pytest.approx(0.015) for r in s.runs)  # ...not in the measured runs
+    assert len(s.ok_runs) == 3 and s.error is None
+
+
+def test_prefill_and_decode_rates_are_exact(fake):
+    s = bm.benchmark_model("ollama", "llama3.1:8b", "Explain B-trees.", 64, runs=2)
+    r = s.runs[0]
+    expected_prompt = prompt_token_count([{"role": "user", "content": "[run 1] Explain B-trees."}])
+    assert r.prompt_tokens == expected_prompt
+    assert r.prefill_tps == pytest.approx(1180.0, rel=1e-6)  # the fake's canned prompt_eval rate
+    assert r.decode_tps == pytest.approx(52.5, rel=1e-6)     # the fake's canned eval rate
+    row = s.row()
+    assert row["prefill_tps"] == 1180.0 and row["decode_tps"] == 52.5 and row["runs"] == 2
+
+
+def test_median_and_range_over_runs(monkeypatch):
+    rates = iter([99.0, 10.0, 30.0, 20.0])  # warm-up, then three runs
+
+    def scripted(model, prompt, num_predict, options=None, keep_alive=None):
+        return bm.Result("ollama", model, ttft_s=0.1, tokens=50, decode_tps=next(rates), e2e_tps=5.0)
+
+    monkeypatch.setattr(bm, "bench_ollama", scripted)
+    monkeypatch.setattr(bm, "running_models", lambda: [])
+    s = bm.benchmark_model("ollama", "m", "p", 50, runs=3)
+    assert s.stat("decode_tps") == 20.0 and s.decode_range == (10.0, 30.0)
+
+
+def test_partial_failures_are_reported(monkeypatch):
+    calls = iter([None, None, "boom", None])
+
+    def flaky(model, prompt, num_predict, options=None, keep_alive=None):
+        err = next(calls)
+        if err:
+            return bm.Result("ollama", model, error=err)
+        return bm.Result("ollama", model, tokens=10, decode_tps=10.0)
+
+    monkeypatch.setattr(bm, "bench_ollama", flaky)
+    monkeypatch.setattr(bm, "running_models", lambda: [])
+    s = bm.benchmark_model("ollama", "m", "p", 10, runs=3)
+    assert len(s.ok_runs) == 2 and s.error == "1 of 3 runs failed: boom"
+
+
+def test_warmup_failure_skips_the_runs(fake):
+    s = bm.benchmark_model("ollama", "oom:qwen2.5:14b", "p", 10, runs=3)
+    assert s.error and not s.runs and len(fake.requests("/api/chat")) == 1
+
+
+def test_ollama_options_reach_the_server(fake):
+    bm.benchmark_model("ollama", "llama3.1:8b", "p", 16, runs=1, options={"num_ctx": 16384, "num_gpu": 20},
+                       keep_alive="10m")
+    body = fake.requests("/api/chat")[-1]["body"]
+    assert body["options"] == {"num_ctx": 16384, "num_gpu": 20, "num_predict": 16}
+    assert body["keep_alive"] == "10m"
+
+
+def test_gpu_share_comes_from_api_ps(fake):
+    assert bm.benchmark_model("ollama", "llama3.1:8b", "p", 8, runs=1).gpu_percent == 100.0
+    assert bm.benchmark_model("ollama", "qwen2.5:14b", "p", 8, runs=1).gpu_percent == pytest.approx(72.0)
+    cpu = bm.benchmark_model("ollama", "llama3.2:3b", "p", 8, runs=1, options={"num_gpu": 0})
+    assert cpu.gpu_percent == 0.0 and cpu.stat("decode_tps") == pytest.approx(95.0 * 0.2)
+    unloaded = bm.benchmark_model("ollama", "llava:7b", "p", 8, runs=1, keep_alive=0)
+    assert unloaded.gpu_percent is None
+    assert bm.parse_keep_alive("0") == 0 and bm.parse_keep_alive("5m") == "5m"
+
+
+def test_cli_header_offload_warning_and_exports(fake, tmp_path, capsys):
+    paths = {ext: tmp_path / f"results.{ext}" for ext in ("json", "csv", "md")}
+    code = bm.main(["--models", "llama3.1:8b", "qwen2.5:14b", "--runs", "2", "--num-predict", "24",
+                    "--num-ctx", "8192", "--json", str(paths["json"]), "--csv", str(paths["csv"]),
+                    "--markdown", str(paths["md"])])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "NVIDIA GeForce RTX 5070 (12.0 GiB VRAM" in out  # detected-hardware header, not a canned note
+    assert "RTX 5070 / 12 GB: a Q4 8B model" not in out
+    assert "qwen2.5:14b: only 72% of the model is in VRAM" in out
+    assert '"num_ctx": 8192' in out
+
+    data = json.loads(paths["json"].read_text(encoding="utf-8"))
+    assert data["hardware"]["gpus"][0]["name"] == "NVIDIA GeForce RTX 5070"
+    assert data["settings"]["runs"] == 2 and data["settings"]["options"] == {"num_ctx": 8192}
+    rows = {r["model"]: r for r in data["results"]}
+    assert rows["llama3.1:8b"]["decode_tps"] == 52.5 and rows["llama3.1:8b"]["gpu_percent"] == 100.0
+    assert rows["qwen2.5:14b"]["decode_tps"] == 14.2 and rows["qwen2.5:14b"]["gpu_percent"] == 72.0
+
+    csv_rows = list(csv.DictReader(io.StringIO(paths["csv"].read_text(encoding="utf-8"))))
+    assert [r["model"] for r in csv_rows] == ["llama3.1:8b", "qwen2.5:14b"]
+    assert list(csv_rows[0]) == bm.COLUMNS and csv_rows[0]["prefill_tps"] == "1180.0"
+
+    md = paths["md"].read_text(encoding="utf-8").splitlines()
+    assert md[0].startswith("| backend | model |") and md[1].startswith("|---|") and len(md) == 4
+
+
+def test_json_to_stdout_keeps_stdout_clean(fake, capsys):
+    code = bm.main(["--models", "llama3.2:3b", "--runs", "1", "--num-predict", "8", "--json", "-"])
+    captured = capsys.readouterr()
+    assert code == 0
+    data = json.loads(captured.out)  # nothing but JSON on stdout
+    assert data["results"][0]["model"] == "llama3.2:3b"
+    assert "tokens/sec benchmark" in captured.err
+
+
+def test_nim_in_the_same_table(fake, fake_nim, capsys):
+    code = bm.main(["--models", "llama3.2:3b", "--nim", "--runs", "2", "--num-predict", "20"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "meta/llama-3.3-70b-instruct" in out and "llama3.2:3b" in out
+    assert len(fake_nim.requests("/v1/chat/completions")) == 3  # warm-up + 2 runs
+
+
+def test_runs_must_be_positive(capsys):
+    assert bm.main(["--runs", "0"]) == 2

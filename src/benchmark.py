@@ -1,45 +1,64 @@
 """Benchmark tokens/sec and first-token latency across local models and NIM.
 
 For local Ollama models this uses the native ``/api/chat`` endpoint, which
-reports exact ``eval_count`` and ``eval_duration`` values, so the decode rate is
+reports exact ``prompt_eval_*`` and ``eval_*`` counters, so the rates are
 measured by the runtime rather than guessed. For NVIDIA NIM it streams over the
 OpenAI API and times each chunk on the client.
 
-Two rates are reported so local and cloud numbers can sit in one table:
+Every model gets one warm-up request (loads the model; its load time is shown as
+"cold load" and it is excluded from the statistics) and then ``--runs`` measured
+requests. The table shows medians, plus the min-max decode range. Each run's
+prompt starts with a distinct ``[run N]`` tag so Ollama's prompt cache cannot
+skip prompt processing and inflate the prefill rate.
 
+Rates reported:
+
+* **prefill tok/s**: prompt processing speed (``prompt_eval_count /
+  prompt_eval_duration``). Local only; NIM does not report it.
 * **decode tok/s**: generation speed once tokens are flowing. Local: Ollama's
   ``eval_count / eval_duration``. NIM: tokens after the first one divided by the
   time between the first and the last streamed chunk. Neither includes model
   load, prompt processing or network latency before the first token.
 * **end-to-end tok/s**: generated tokens divided by the whole request's wall
-  time, first-token latency (and, locally, model load) included.
+  time, first-token latency included.
+
+After a model's runs, ``/api/ps`` tells how much of it Ollama kept in VRAM; a
+share under 100% means layers were offloaded to the CPU, the usual reason for a
+low decode rate on consumer GPUs.
 
 Usage:
-    python -m src.benchmark                       # every installed local chat model
-    python -m src.benchmark --models llama3.1:8b qwen2.5:7b
-    python -m src.benchmark --nim                 # add cloud NIM to the comparison
-    python -m src.benchmark --num-predict 256 --prompt "Explain B-trees."
+    python -m src.benchmark                                  # every installed local chat model
+    python -m src.benchmark --models llama3.1:8b qwen2.5:14b --runs 5
+    python -m src.benchmark --models qwen2.5:14b --num-ctx 16384 --num-gpu 40
+    python -m src.benchmark --nim                            # add cloud NIM to the comparison
+    python -m src.benchmark --json results.json --csv results.csv --markdown results.md
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
+import statistics
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from . import hardware as hw
 from .client import LLMClient, MissingAPIKey, ollama_host, resolve_model
-from .model_manager import OllamaError, check_server, list_models, show_model
+from .model_manager import OllamaError, check_server, gpu_share, list_models, running_models, show_model
 
 console = Console()
 
 DEFAULT_PROMPT = "Write a concise paragraph explaining how a CPU cache improves performance."
 DEFAULT_NUM_PREDICT = 200
+DEFAULT_RUNS = 3
 
 # Used only when the server is too old to report model capabilities in /api/show.
 EMBEDDING_NAME_HINTS = (
@@ -49,6 +68,8 @@ EMBEDDING_NAME_HINTS = (
 
 @dataclass
 class Result:
+    """One request's measurements."""
+
     backend: str
     model: str
     ttft_s: float | None = None        # client-measured time to first token, seconds
@@ -58,12 +79,68 @@ class Result:
     total_s: float = 0.0               # wall time of the whole request
     e2e_tps: float = 0.0               # tokens / total_s
     load_s: float | None = None        # model load time when reported (local only)
+    prompt_tokens: int | None = None   # prompt tokens processed (local only)
+    prefill_s: float | None = None
+    prefill_tps: float | None = None
     error: str | None = None
 
     @property
     def tokens_per_sec(self) -> float:
         """Backwards-compatible alias for :attr:`decode_tps`."""
         return self.decode_tps
+
+
+def _median(values: list[float | None]) -> float | None:
+    present = [v for v in values if v is not None]
+    return statistics.median(present) if present else None
+
+
+@dataclass
+class Summary:
+    """A model's warm-up plus measured runs."""
+
+    backend: str
+    model: str
+    runs: list[Result] = field(default_factory=list)
+    warmup: Result | None = None
+    gpu_percent: float | None = None
+    error: str | None = None
+
+    @property
+    def ok_runs(self) -> list[Result]:
+        return [r for r in self.runs if r.error is None]
+
+    def stat(self, attr: str) -> float | None:
+        return _median([getattr(r, attr) for r in self.ok_runs])
+
+    @property
+    def decode_range(self) -> tuple[float, float] | None:
+        rates = [r.decode_tps for r in self.ok_runs]
+        return (min(rates), max(rates)) if rates else None
+
+    def row(self) -> dict:
+        """Flat record used by the JSON / CSV / Markdown exports."""
+        rng = self.decode_range
+
+        def rnd(value, digits=2):
+            return None if value is None else round(value, digits)
+
+        return {
+            "backend": self.backend,
+            "model": self.model,
+            "runs": len(self.ok_runs),
+            "tokens": rnd(self.stat("tokens"), 1),
+            "ttft_s": rnd(self.stat("ttft_s"), 3),
+            "prompt_tokens": rnd(self.stat("prompt_tokens"), 1),
+            "prefill_tps": rnd(self.stat("prefill_tps"), 1),
+            "decode_tps": rnd(self.stat("decode_tps"), 1),
+            "decode_tps_min": rnd(rng[0], 1) if rng else None,
+            "decode_tps_max": rnd(rng[1], 1) if rng else None,
+            "e2e_tps": rnd(self.stat("e2e_tps"), 1),
+            "cold_load_s": rnd(self.warmup.load_s if self.warmup else None, 3),
+            "gpu_percent": rnd(self.gpu_percent, 1),
+            "error": self.error,
+        }
 
 
 def _error_text(resp: requests.Response) -> str:
@@ -76,10 +153,26 @@ def _error_text(resp: requests.Response) -> str:
     return str(err) if err else f"HTTP {resp.status_code} {resp.reason}"
 
 
-def bench_ollama(model: str, prompt: str, num_predict: int) -> Result:
-    """Benchmark one local model via Ollama's native streaming chat API.
+def parse_keep_alive(value: str | None):
+    """Ollama accepts a duration string ("5m", "1h") or a number of seconds (0 unloads)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
 
-    Ollama reports failures in two ways and both become an error row: a non-2xx
+
+def bench_ollama(
+    model: str,
+    prompt: str,
+    num_predict: int,
+    options: dict | None = None,
+    keep_alive=None,
+) -> Result:
+    """Run one request against a local model via Ollama's native streaming chat API.
+
+    Ollama reports failures in two ways and both become an error result: a non-2xx
     response with a JSON ``error`` body, or an ``{"error": ...}`` event inside an
     HTTP 200 stream (for example when the model cannot be loaded into memory).
     """
@@ -88,8 +181,10 @@ def bench_ollama(model: str, prompt: str, num_predict: int) -> Result:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
-        "options": {"num_predict": num_predict},
+        "options": {**(options or {}), "num_predict": num_predict},
     }
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
 
     def failed(message: str) -> Result:
         return Result("ollama", model, error=message)
@@ -127,9 +222,12 @@ def bench_ollama(model: str, prompt: str, num_predict: int) -> Result:
     eval_count = int(final.get("eval_count") or 0)
     eval_ns = int(final.get("eval_duration") or 0)
     load_ns = int(final.get("load_duration") or 0)
+    prompt_count = final.get("prompt_eval_count")
+    prompt_ns = int(final.get("prompt_eval_duration") or 0)
     if eval_count == 0:
         return failed("the model generated no tokens")
     decode_s = eval_ns / 1e9
+    prefill_s = prompt_ns / 1e9 if prompt_ns else None
     return Result(
         backend="ollama",
         model=model,
@@ -140,6 +238,9 @@ def bench_ollama(model: str, prompt: str, num_predict: int) -> Result:
         total_s=total,
         e2e_tps=eval_count / total if total > 0 else 0.0,
         load_s=load_ns / 1e9 if load_ns else None,
+        prompt_tokens=int(prompt_count) if prompt_count is not None else None,
+        prefill_s=prefill_s,
+        prefill_tps=(int(prompt_count) / prefill_s) if prefill_s and prompt_count else None,
     )
 
 
@@ -163,7 +264,7 @@ def stream_stats(start: float, arrivals: list[float], end: float, usage_tokens: 
 
 
 def bench_nim(prompt: str, num_predict: int, model: str | None = None) -> Result:
-    """Benchmark the cloud NIM chat model via the OpenAI streaming API."""
+    """Run one request against the cloud NIM chat model via the OpenAI streaming API."""
     model = model or resolve_model("chat", "nim")
     try:
         client = LLMClient.create("nim")
@@ -172,7 +273,7 @@ def bench_nim(prompt: str, num_predict: int, model: str | None = None) -> Result
 
     messages = [{"role": "user", "content": prompt}]
     arrivals: list[float] = []
-    usage_tokens = None
+    usage = None
     start = time.perf_counter()
     try:
         stream = client.client.chat.completions.create(
@@ -184,49 +285,146 @@ def bench_nim(prompt: str, num_predict: int, model: str | None = None) -> Result
         )
         for chunk in stream:
             if chunk.usage is not None and chunk.usage.completion_tokens:
-                usage_tokens = chunk.usage.completion_tokens
+                usage = chunk.usage
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             if delta and delta.content:
                 arrivals.append(time.perf_counter())
-    except Exception as exc:  # network, auth, rate limit: report as an error row
+    except Exception as exc:  # network, auth, rate limit: report as an error result
         return Result("nim", model, error=str(exc))
-    stats = stream_stats(start, arrivals, time.perf_counter(), usage_tokens)
+    stats = stream_stats(start, arrivals, time.perf_counter(), usage.completion_tokens if usage else None)
     if not stats["tokens"]:
         return Result("nim", model, error="the model generated no tokens")
-    return Result("nim", model, **stats)
+    return Result("nim", model, prompt_tokens=usage.prompt_tokens if usage else None, **stats)
 
 
-def render(results: list[Result]) -> None:
-    """Print a comparison table of the benchmark results."""
-    table = Table(title="tokens/sec benchmark")
+def run_prompt(prompt: str, run: int) -> str:
+    """Tag each run's prompt so Ollama's prompt (KV) cache cannot skip prefill."""
+    return f"[run {run}] {prompt}"
+
+
+def benchmark_model(
+    backend: str,
+    model: str,
+    prompt: str,
+    num_predict: int,
+    runs: int = DEFAULT_RUNS,
+    warmup: bool = True,
+    options: dict | None = None,
+    keep_alive=None,
+) -> Summary:
+    """One excluded warm-up request, then ``runs`` measured requests."""
+
+    def once(i: int) -> Result:
+        if backend == "ollama":
+            return bench_ollama(model, run_prompt(prompt, i), num_predict, options, keep_alive)
+        return bench_nim(run_prompt(prompt, i), num_predict, model)
+
+    summary = Summary(backend, model)
+    if warmup:
+        summary.warmup = once(0)
+        if summary.warmup.error:
+            summary.error = summary.warmup.error
+            return summary
+    summary.runs = [once(i) for i in range(1, runs + 1)]
+    errors = [r.error for r in summary.runs if r.error]
+    if errors and not summary.ok_runs:
+        summary.error = errors[0]
+    elif errors:
+        summary.error = f"{len(errors)} of {runs} runs failed: {errors[0]}"
+    if backend == "ollama" and summary.ok_runs:
+        try:
+            entry = next((m for m in running_models() if m.get("name") == model or m.get("model") == model), None)
+        except requests.RequestException:
+            entry = None
+        summary.gpu_percent = gpu_share(entry) if entry else None
+    return summary
+
+
+# -- output ---------------------------------------------------------------------------
+COLUMNS = ["backend", "model", "runs", "tokens", "ttft_s", "prompt_tokens", "prefill_tps", "decode_tps",
+           "decode_tps_min", "decode_tps_max", "e2e_tps", "cold_load_s", "gpu_percent", "error"]
+
+
+def _fmt(value, suffix: str = "", digits: int = 1) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{digits}f}{suffix}"
+
+
+def render(summaries: list[Summary], out: Console | None = None) -> None:
+    """Print a comparison table of the benchmark summaries."""
+    out = out or console
+    table = Table(title="tokens/sec benchmark (medians)")
     table.add_column("Backend")
     table.add_column("Model", style="cyan", no_wrap=True)
+    table.add_column("Runs", justify="right")
     table.add_column("First token", justify="right")
-    table.add_column("Tokens", justify="right")
+    table.add_column("Prefill tok/s", justify="right")
     table.add_column("Decode tok/s", justify="right", style="bold green")
+    table.add_column("min-max", justify="right")
     table.add_column("End-to-end tok/s", justify="right")
-    table.add_column("Load", justify="right")
+    table.add_column("Cold load", justify="right")
+    table.add_column("On GPU", justify="right")
 
-    for r in sorted(results, key=lambda x: (x.error is not None, -x.decode_tps)):
-        if r.error:
-            table.add_row(r.backend, escape(r.model), "-", "-", "[red]error[/red]", "-", "-")
+    def key(s: Summary):
+        return (not s.ok_runs, -(s.stat("decode_tps") or 0.0))
+
+    for s in sorted(summaries, key=key):
+        if not s.ok_runs:
+            table.add_row(s.backend, escape(s.model), "0", "-", "-", "[red]error[/red]", "-", "-", "-", "-")
             continue
+        rng = s.decode_range
         table.add_row(
-            r.backend,
-            escape(r.model),
-            f"{r.ttft_s:.2f} s" if r.ttft_s is not None else "-",
-            str(r.tokens),
-            f"{r.decode_tps:.1f}",
-            f"{r.e2e_tps:.1f}",
-            f"{r.load_s:.2f} s" if r.load_s is not None else "-",
+            s.backend,
+            escape(s.model),
+            str(len(s.ok_runs)),
+            _fmt(s.stat("ttft_s"), " s", 2),
+            _fmt(s.stat("prefill_tps")),
+            _fmt(s.stat("decode_tps")),
+            f"{rng[0]:.1f}-{rng[1]:.1f}" if rng else "-",
+            _fmt(s.stat("e2e_tps")),
+            _fmt(s.warmup.load_s if s.warmup else None, " s", 2),
+            _fmt(s.gpu_percent, "%", 0),
         )
-    console.print(table)
+    out.print(table)
 
-    for r in results:
-        if r.error:
-            console.print(f"[red]{escape(r.model)}:[/red] {escape(r.error)}")
+    for s in summaries:
+        if s.error:
+            out.print(f"[red]{escape(s.model)}:[/red] {escape(s.error)}")
+    for s in summaries:
+        if s.gpu_percent is not None and s.gpu_percent < 99.5:
+            out.print(
+                f"[yellow]{escape(s.model)}: only {s.gpu_percent:.0f}% of the model is in VRAM; the rest runs on "
+                "the CPU and caps decode speed.[/yellow] [dim]Lower --num-ctx or try a smaller model; plan it with "
+                "python -m src.model_manager fit[/dim]"
+            )
+
+
+def to_markdown(rows: list[dict]) -> str:
+    header = "| " + " | ".join(COLUMNS) + " |"
+    sep = "|" + "|".join("---" for _ in COLUMNS) + "|"
+    body = ["| " + " | ".join("" if r[c] is None else str(r[c]).replace("|", "\\|") for c in COLUMNS) + " |"
+            for r in rows]
+    return "\n".join([header, sep, *body]) + "\n"
+
+
+def to_csv(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def export(path: str, text: str) -> None:
+    if path == "-":
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    else:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
 
 
 def looks_like_embedding_model(name: str, family: str = "") -> bool:
@@ -272,39 +470,83 @@ def select_local_models(explicit: list[str] | None) -> tuple[list[str], list[tup
     return selected, skipped
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="benchmark", description="Measure tokens/sec and first-token latency.")
-    parser.add_argument("--models", nargs="*", help="Specific local models to test (default: all installed)")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="benchmark", description="Measure prefill/decode tokens/sec and latency.")
+    parser.add_argument("--models", nargs="*", help="Specific local models to test (default: all installed chat models)")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt to send")
+    parser.add_argument("--prompt-file", default=None, help="Read the prompt from a file (a long prompt gives a steadier prefill rate)")
     parser.add_argument("--num-predict", type=int, default=DEFAULT_NUM_PREDICT, help="Max tokens to generate")
+    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help=f"Measured runs per model (default {DEFAULT_RUNS})")
+    parser.add_argument("--no-warmup", action="store_true", help="Skip the excluded warm-up request")
+    parser.add_argument("--num-ctx", type=int, default=None, help="Ollama option num_ctx (context window)")
+    parser.add_argument("--num-gpu", type=int, default=None, help="Ollama option num_gpu (layers on the GPU; 0 = CPU only)")
+    parser.add_argument("--keep-alive", default=None, help="How long Ollama keeps the model loaded (e.g. 5m, 0)")
     parser.add_argument("--nim", action="store_true", help="Also benchmark cloud NVIDIA NIM (needs NVIDIA_API_KEY)")
+    parser.add_argument("--nim-model", default=None, help="NIM model id (default: the chat role's NIM model)")
     parser.add_argument("--no-local", action="store_true", help="Skip local models (use with --nim)")
-    args = parser.parse_args(argv)
+    parser.add_argument("--json", metavar="PATH", help="Write results as JSON ('-' for stdout)")
+    parser.add_argument("--csv", metavar="PATH", help="Write results as CSV ('-' for stdout)")
+    parser.add_argument("--markdown", metavar="PATH", help="Write results as a Markdown table ('-' for stdout)")
+    return parser
 
-    results: list[Result] = []
 
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    to_stdout = "-" in (args.json, args.csv, args.markdown)
+    out = Console(stderr=True) if to_stdout else console
+    if args.runs < 1:
+        out.print("[red]--runs must be at least 1[/red]")
+        return 2
+    prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file, encoding="utf-8") as fh:
+            prompt = fh.read().strip()
+
+    options = {k: v for k, v in (("num_ctx", args.num_ctx), ("num_gpu", args.num_gpu)) if v is not None}
+    keep_alive = parse_keep_alive(args.keep_alive)
+    hardware = hw.detect()
+    out.print(f"[dim]{escape(hardware.describe())}[/dim]")
+    if options or keep_alive is not None:
+        out.print(f"[dim]Ollama options: {escape(json.dumps({**options, 'keep_alive': keep_alive}))}[/dim]")
+
+    summaries: list[Summary] = []
     if not args.no_local:
         if not check_server():
             return 1
         models, skipped = select_local_models(args.models)
         for name, reason in skipped:
-            console.print(f"[dim]Skipping {escape(name)}: {escape(reason)}[/dim]")
+            out.print(f"[dim]Skipping {escape(name)}: {escape(reason)}[/dim]")
         if not models:
-            console.print("No local chat models installed. Try [bold]python -m src.model_manager recommend[/bold].")
+            out.print("No local chat models installed. Try [bold]python -m src.model_manager recommend[/bold].")
         for model in models:
-            console.print(f"Benchmarking [cyan]{escape(model)}[/cyan] ...")
-            results.append(bench_ollama(model, args.prompt, args.num_predict))
+            out.print(f"Benchmarking [cyan]{escape(model)}[/cyan]: "
+                      f"{'1 warm-up + ' if not args.no_warmup else ''}{args.runs} run(s) ...")
+            summaries.append(benchmark_model("ollama", model, prompt, args.num_predict, args.runs,
+                                             not args.no_warmup, options, keep_alive))
 
     if args.nim:
-        console.print("Benchmarking [cyan]NVIDIA NIM[/cyan] ...")
-        results.append(bench_nim(args.prompt, args.num_predict))
+        nim_model = args.nim_model or resolve_model("chat", "nim")
+        out.print(f"Benchmarking [cyan]NVIDIA NIM {escape(nim_model)}[/cyan] ...")
+        summaries.append(benchmark_model("nim", nim_model, prompt, args.num_predict, args.runs, not args.no_warmup))
 
-    if not results:
-        console.print("Nothing to benchmark.")
+    if not summaries:
+        out.print("Nothing to benchmark.")
         return 1
 
-    render(results)
-    return 1 if all(r.error for r in results) else 0
+    render(summaries, out)
+    rows = [s.row() for s in summaries]
+    if args.json:
+        export(args.json, json.dumps({
+            "hardware": hardware.as_dict(),
+            "settings": {"prompt": prompt, "num_predict": args.num_predict, "runs": args.runs,
+                         "warmup": not args.no_warmup, "options": options, "keep_alive": keep_alive},
+            "results": rows,
+        }, indent=2) + "\n")
+    if args.csv:
+        export(args.csv, to_csv(rows))
+    if args.markdown:
+        export(args.markdown, to_markdown(rows))
+    return 1 if all(not s.ok_runs for s in summaries) else 0
 
 
 if __name__ == "__main__":
