@@ -19,11 +19,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 import requests
 import yaml
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -34,8 +34,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from client import ollama_host  # noqa: E402
+from .client import ollama_host
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_YAML = os.path.join(REPO_ROOT, "models.yaml")
@@ -65,13 +64,24 @@ def check_server() -> bool:
 
 
 def human_size(num_bytes: float) -> str:
-    """Format a byte count as a compact human string."""
+    """Format a byte count with decimal units, the same way ``ollama list`` does."""
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
+        if size < 1000 or unit == "TB":
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
-        size /= 1024
+        size /= 1000
     return f"{size:.1f} TB"
+
+
+def _error_message(resp: requests.Response) -> str:
+    """The ``error`` text Ollama puts in a failed response body, or the HTTP reason."""
+    try:
+        err = resp.json().get("error")
+    except ValueError:
+        err = None
+    if isinstance(err, dict):
+        err = err.get("message")
+    return str(err) if err else f"HTTP {resp.status_code} {resp.reason}"
 
 
 # -- Ollama API calls -----------------------------------------------------
@@ -84,30 +94,37 @@ def list_models() -> list[dict]:
 
 def show_model(name: str) -> dict:
     """Return model metadata from ``/api/show``."""
-    resp = requests.post(_api("/api/show"), json={"name": name}, timeout=30)
+    resp = requests.post(_api("/api/show"), json={"model": name, "name": name}, timeout=30)
     if resp.status_code == 404:
         raise OllamaError(f"Model {name!r} is not installed locally.")
-    resp.raise_for_status()
+    if not resp.ok:
+        raise OllamaError(_error_message(resp))
     return resp.json()
 
 
 def delete_model(name: str) -> None:
     """Remove a model with ``/api/delete``."""
-    resp = requests.delete(_api("/api/delete"), json={"name": name}, timeout=30)
+    resp = requests.delete(_api("/api/delete"), json={"model": name, "name": name}, timeout=30)
     if resp.status_code == 404:
         raise OllamaError(f"Model {name!r} is not installed locally.")
-    resp.raise_for_status()
+    if not resp.ok:
+        raise OllamaError(_error_message(resp))
 
 
 def pull_model(name: str) -> None:
     """Pull a model, streaming download progress to a live Rich bar.
 
-    Ollama streams newline-delimited JSON objects describing each layer's
-    ``total`` and ``completed`` byte counts; we render the aggregate.
+    Ollama streams newline-delimited JSON objects, one per progress update of
+    each layer (``digest``, ``total``, ``completed``). The bar shows the sum over
+    all layers, so it moves forward once instead of restarting for every layer.
     """
-    resp = requests.post(_api("/api/pull"), json={"name": name, "stream": True}, stream=True, timeout=None)
-    resp.raise_for_status()
+    resp = requests.post(
+        _api("/api/pull"), json={"model": name, "name": name, "stream": True}, stream=True, timeout=None
+    )
+    if not resp.ok:
+        raise OllamaError(_error_message(resp))
 
+    layers: dict[str, tuple[int, int]] = {}
     with Progress(
         TextColumn("[bold blue]{task.description}"),
         BarColumn(),
@@ -131,18 +148,21 @@ def pull_model(name: str) -> None:
 
             status = event.get("status", "")
             total = event.get("total")
-            completed = event.get("completed", 0)
 
             if total:
+                layers[event.get("digest") or status] = (int(total), int(event.get("completed") or 0))
+                grand_total = sum(t for t, _c in layers.values())
+                done = sum(c for _t, c in layers.values())
                 if task_id is None:
-                    task_id = progress.add_task(status or "downloading", total=total)
-                progress.update(task_id, description=status or "downloading", total=total, completed=completed)
+                    task_id = progress.add_task("downloading", total=grand_total)
+                progress.update(task_id, description=f"downloading {len(layers)} layer(s)",
+                                total=grand_total, completed=done)
             elif status and status != last_status:
                 # Non-download phases: verifying, writing manifest, success.
-                console.print(f"  [dim]{status}[/dim]")
+                console.print(f"  [dim]{escape(status)}[/dim]")
             last_status = status
 
-    console.print(f"[green]Done.[/green] {name} is ready.")
+    console.print(f"[green]Done.[/green] {escape(name)} is ready.")
 
 
 # -- curated recommendations ---------------------------------------------
@@ -170,7 +190,7 @@ def cmd_list(_args) -> int:
     for m in sorted(models, key=lambda x: x.get("name", "")):
         details = m.get("details", {}) or {}
         table.add_row(
-            m.get("name", "?"),
+            escape(m.get("name", "?")),
             human_size(m.get("size", 0)),
             details.get("family", "-"),
             details.get("parameter_size", "-"),
@@ -210,11 +230,11 @@ def cmd_recommend(_args) -> int:
 def cmd_pull(args) -> int:
     if not check_server():
         return 1
-    console.print(f"Pulling [cyan]{args.name}[/cyan] ...")
+    console.print(f"Pulling [cyan]{escape(args.name)}[/cyan] ...")
     try:
         pull_model(args.name)
     except OllamaError as exc:
-        console.print(f"[red]Pull failed:[/red] {exc}")
+        console.print(f"[red]Pull failed:[/red] {escape(str(exc))}")
         return 1
     return 0
 
@@ -225,10 +245,10 @@ def cmd_show(args) -> int:
     try:
         info = show_model(args.name)
     except OllamaError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         return 1
     details = info.get("details", {}) or {}
-    table = Table(title=f"{args.name}", show_header=False)
+    table = Table(title=escape(args.name), show_header=False)
     table.add_column("Field", style="bold")
     table.add_column("Value")
     table.add_row("Family", details.get("family", "-"))
@@ -243,7 +263,7 @@ def cmd_show(args) -> int:
     params = info.get("parameters")
     if params:
         console.print("\n[bold]Default parameters[/bold]")
-        console.print(params.strip())
+        console.print(params.strip(), markup=False, highlight=False)
     return 0
 
 
@@ -253,10 +273,29 @@ def cmd_remove(args) -> int:
     try:
         delete_model(args.name)
     except OllamaError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         return 1
-    console.print(f"[green]Removed[/green] {args.name}.")
+    console.print(f"[green]Removed[/green] {escape(args.name)}.")
     return 0
+
+
+def disk_usage(models: list[dict]) -> tuple[list[dict], int]:
+    """Group installed tags by manifest digest and total the bytes on disk.
+
+    Ollama stores content-addressed blobs, so two tags with the same digest
+    (``llama3.1:latest`` and ``llama3.1:8b``, say) are one copy on disk. Summing
+    ``size`` per tag double-counts them. Returns one row per digest, largest
+    first (``{"names": [...], "size": int, "digest": str}``), and the real total.
+    """
+    groups: dict[str, dict] = {}
+    for m in models:
+        key = m.get("digest") or f"name:{m.get('name')}"
+        group = groups.setdefault(key, {"names": [], "size": int(m.get("size", 0) or 0), "digest": m.get("digest", "")})
+        group["names"].append(m.get("name", "?"))
+    rows = sorted(groups.values(), key=lambda g: (-g["size"], g["names"][0]))
+    for row in rows:
+        row["names"].sort()
+    return rows, sum(g["size"] for g in rows)
 
 
 def cmd_du(_args) -> int:
@@ -266,15 +305,22 @@ def cmd_du(_args) -> int:
     if not models:
         console.print("No models installed, so nothing on disk.")
         return 0
-    total = sum(m.get("size", 0) for m in models)
+    rows, total = disk_usage(models)
     table = Table(title="Disk usage by model")
     table.add_column("Model", style="cyan")
     table.add_column("Size", justify="right")
-    for m in sorted(models, key=lambda x: x.get("size", 0), reverse=True):
-        table.add_row(m.get("name", "?"), human_size(m.get("size", 0)))
+    table.add_column("Shared with", style="dim")
+    for row in rows:
+        first, *aliases = row["names"]
+        table.add_row(escape(first), human_size(row["size"]), escape(", ".join(aliases)) if aliases else "")
     table.add_section()
-    table.add_row("[bold]Total[/bold]", f"[bold]{human_size(total)}[/bold]")
+    table.add_row("[bold]Total on disk[/bold]", f"[bold]{human_size(total)}[/bold]", "")
     console.print(table)
+    shared = sum(len(r["names"]) - 1 for r in rows)
+    if shared:
+        console.print(
+            f"[dim]{shared} tag(s) share the same manifest digest as another tag and are counted once.[/dim]"
+        )
     return 0
 
 
@@ -309,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except requests.RequestException as exc:
-        console.print(f"[red]Ollama request failed:[/red] {exc}")
+        console.print(f"[red]Ollama request failed:[/red] {escape(str(exc))}")
         return 1
 
 

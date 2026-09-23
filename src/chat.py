@@ -21,13 +21,11 @@ Start it with:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 
 from rich.console import Console
+from rich.markup import escape
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from client import LLMClient, MissingAPIKey, resolve_backend  # noqa: E402
+from .client import LLMClient, MissingAPIKey, resolve_backend
 
 console = Console()
 
@@ -42,6 +40,22 @@ HELP_TEXT = """\
   /help                   show this help
   /exit                   quit
 """
+
+
+def print_plain(text: str, end: str = "\n") -> None:
+    """Print model or user text literally.
+
+    Model output routinely contains square brackets (``[INST]``, ``[/INST]``,
+    ``[1]``, ``[bold]``). Rich would parse them as markup: unknown tags vanish
+    and an unmatched closing tag raises ``MarkupError``, which used to crash the
+    REPL mid-answer. Markup, emoji codes and auto-highlighting are off here.
+    """
+    console.print(text, end=end, markup=False, highlight=False, emoji=False)
+
+
+def print_error(prefix: str, exc: BaseException | str) -> None:
+    """Print an error whose message may contain brackets from the server or model."""
+    console.print(f"[red]{prefix}[/red]{escape(str(exc))}" if prefix else f"[red]{escape(str(exc))}[/red]")
 
 
 class ChatSession:
@@ -82,7 +96,7 @@ class ChatSession:
         if self.rag_store is not None:
             return
         # Imported lazily so plain chat has no NumPy import cost.
-        from rag_local import VectorStore  # noqa: E402
+        from .rag_local import VectorStore
 
         self.rag_embed_client = LLMClient.create("ollama")
         console.print("[dim]Building local RAG index ...[/dim]")
@@ -90,7 +104,7 @@ class ChatSession:
 
     def _augment_with_rag(self, user_text: str) -> tuple[str, list]:
         """Return a context-grounded user message and the retrieved hits."""
-        from rag_local import format_context
+        from .rag_local import format_context
 
         self._ensure_rag()
         hits = self.rag_store.search(user_text, k=4)
@@ -109,7 +123,7 @@ class ChatSession:
             try:
                 prompt_text, hits = self._augment_with_rag(user_text)
             except Exception as exc:
-                console.print(f"[red]RAG unavailable:[/red] {exc}")
+                print_error("RAG unavailable: ", exc)
                 prompt_text = user_text
         else:
             prompt_text = user_text
@@ -120,12 +134,14 @@ class ChatSession:
         try:
             for token in self.client.stream(messages, model=self.model_override):
                 parts.append(token)
-                console.print(token, end="")
+                print_plain(token, end="")
         except MissingAPIKey as exc:
-            console.print(f"\n[red]{exc}[/red]")
+            console.print()
+            print_error("", exc)
             return
         except Exception as exc:
-            console.print(f"\n[red]Request failed:[/red] {exc}")
+            console.print()
+            print_error("Request failed: ", exc)
             return
         console.print()
 
@@ -136,7 +152,7 @@ class ChatSession:
 
         if hits:
             names = ", ".join(f"[{i}] {c.doc}" for i, (c, _s) in enumerate(hits, start=1))
-            console.print(f"[dim]sources: {names}[/dim]")
+            console.print(f"[dim]sources: {escape(names)}[/dim]")
 
 
 def handle_command(session: ChatSession, line: str) -> bool:
@@ -166,29 +182,31 @@ def handle_command(session: ChatSession, line: str) -> bool:
     elif cmd == "/model":
         if arg:
             session.model_override = arg
-            console.print(f"[dim]Chat model set to {arg}.[/dim]")
+            console.print(f"[dim]Chat model set to {escape(arg)}.[/dim]")
         else:
-            console.print(f"Current model: {session.model}")
+            print_plain(f"Current model: {session.model}")
     elif cmd == "/backend":
         if arg.lower() in ("ollama", "nim"):
             try:
                 session.client = LLMClient.create(arg.lower())
                 session.model_override = None
-                console.print(f"[dim]Backend switched to {session.backend}; model reset to {session.model}.[/dim]")
+                console.print(
+                    f"[dim]Backend switched to {session.backend}; model reset to {escape(session.model)}.[/dim]"
+                )
             except MissingAPIKey as exc:
-                console.print(f"[red]{exc}[/red]")
+                print_error("", exc)
         else:
             console.print("Usage: /backend ollama | nim")
     elif cmd == "/models":
         _print_models()
     else:
-        console.print(f"Unknown command {cmd!r}. Try /help.")
+        print_plain(f"Unknown command {cmd!r}. Try /help.")
     return True
 
 
 def _print_models() -> None:
     try:
-        from model_manager import check_server, list_models
+        from .model_manager import check_server, list_models
 
         if not check_server():
             return
@@ -197,14 +215,17 @@ def _print_models() -> None:
             console.print("No local models installed.")
             return
         for m in sorted(models, key=lambda x: x.get("name", "")):
-            console.print(f"  {m.get('name')}")
+            print_plain(f"  {m.get('name')}")
     except Exception as exc:
-        console.print(f"[red]Could not list models:[/red] {exc}")
+        print_error("Could not list models: ", exc)
 
 
 def banner(session: ChatSession) -> None:
     console.print("[bold]ollama-local-llm-kit[/bold] chat REPL. Type /help for commands, /exit to quit.")
-    console.print(f"[dim]backend={session.backend}  model={session.model}  rag={'on' if session.rag else 'off'}[/dim]\n")
+    console.print(
+        f"[dim]backend={session.backend}  model={escape(session.model)}  "
+        f"rag={'on' if session.rag else 'off'}[/dim]\n"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -217,13 +238,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         backend = resolve_backend(args.backend)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        print_error("", exc)
         return 1
 
     try:
         session = ChatSession(backend=backend, system=args.system, rag=args.rag)
     except MissingAPIKey as exc:
-        console.print(f"[red]{exc}[/red]")
+        print_error("", exc)
         return 1
 
     banner(session)

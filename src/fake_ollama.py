@@ -883,14 +883,26 @@ class FakeHandler(BaseHTTPRequestHandler):
                               "usage": {"prompt_tokens": tokens, "total_tokens": tokens}})
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        """Clients hanging up on a keep-alive connection is normal, not an error."""
+        import sys
+
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class FakeOllamaServer:
     """Run the fake in a background thread: ``with FakeOllamaServer() as fake: fake.url``."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0, nim: bool = False,
                  first_token_delay_s: float = 0.0, token_delay_s: float = 0.0, verbose: bool = False):
         self.state = FakeState(nim=nim, first_token_delay_s=first_token_delay_s, token_delay_s=token_delay_s)
-        self.httpd = ThreadingHTTPServer((host, port), FakeHandler)
-        self.httpd.daemon_threads = True
+        self.httpd = _QuietThreadingHTTPServer((host, port), FakeHandler)
         self.httpd.state = self.state  # type: ignore[attr-defined]
         self.httpd.verbose = verbose  # type: ignore[attr-defined]
         self._thread: threading.Thread | None = None

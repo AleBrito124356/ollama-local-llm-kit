@@ -20,19 +20,24 @@ import argparse
 import glob
 import hashlib
 import os
-import sys
-import textwrap
 from dataclasses import dataclass
 
 import numpy as np
+import openai
 from rich.console import Console
+from rich.markup import escape
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from client import LLMClient, resolve_model  # noqa: E402
+from .client import LLMClient
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_DIR = os.path.join(REPO_ROOT, "sample_docs")
 CACHE_PATH = os.path.join(REPO_ROOT, ".rag_cache.npz")
+
+
+def cache_path() -> str:
+    """Where the vector cache lives (``RAG_CACHE_DIR`` overrides the repo root)."""
+    override = os.getenv("RAG_CACHE_DIR")
+    return os.path.join(override, ".rag_cache.npz") if override else CACHE_PATH
 
 console = Console()
 
@@ -99,6 +104,7 @@ def _corpus_fingerprint(chunks: list[Chunk], model: str) -> str:
     """Stable hash of the chunk texts plus embedding model, for cache validation."""
     hasher = hashlib.sha256()
     hasher.update(model.encode("utf-8"))
+    hasher.update(b"input_type=passage")  # documents are embedded as passages
     for c in chunks:
         hasher.update(c.doc.encode("utf-8"))
         hasher.update(c.text.encode("utf-8"))
@@ -117,7 +123,7 @@ class VectorStore:
 
     def __init__(self, client: LLMClient):
         self.client = client
-        self.embed_model = resolve_model("embed", "ollama")
+        self.embed_model = client.model_for("embed")
         self.chunks: list[Chunk] = []
         self.matrix: np.ndarray | None = None  # shape (n_chunks, dim), L2-normalized
         self.fingerprint: str = ""
@@ -132,37 +138,43 @@ class VectorStore:
         if not force and self._load_cache():
             return self
 
-        console.print(f"Embedding {len(self.chunks)} chunks with [cyan]{self.embed_model}[/cyan] ...")
-        vectors = self.client.embed([c.text for c in self.chunks])
+        console.print(f"Embedding {len(self.chunks)} chunks with [cyan]{escape(self.embed_model)}[/cyan] ...")
+        vectors = self.client.embed([c.text for c in self.chunks], input_type="passage")
         self.matrix = _normalize(np.array(vectors, dtype=np.float32))
         self._save_cache()
         return self
 
     def _load_cache(self) -> bool:
-        if not os.path.exists(CACHE_PATH):
+        path = cache_path()
+        if not os.path.exists(path):
             return False
         try:
-            data = np.load(CACHE_PATH, allow_pickle=True)
-        except (OSError, ValueError):
+            # The cache only holds a float matrix and a unicode string, so pickled
+            # objects are never needed; refusing them keeps a tampered cache file
+            # from executing code.
+            with np.load(path, allow_pickle=False) as data:
+                if str(data["fingerprint"]) != self.fingerprint:
+                    return False
+                matrix = data["matrix"]
+        except (OSError, ValueError, KeyError):
             return False
-        if str(data.get("fingerprint")) != self.fingerprint:
+        if matrix.shape[0] != len(self.chunks):
             return False
-        self.matrix = data["matrix"]
+        self.matrix = matrix
         console.print(f"[dim]Loaded {self.matrix.shape[0]} cached embeddings.[/dim]")
         return True
 
     def _save_cache(self) -> None:
-        np.savez(
-            CACHE_PATH,
-            matrix=self.matrix,
-            fingerprint=np.array(self.fingerprint),
-        )
+        path = cache_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            np.savez(fh, matrix=self.matrix, fingerprint=np.array(self.fingerprint))
 
     def search(self, query: str, k: int = TOP_K) -> list[tuple[Chunk, float]]:
         """Return the top-k chunks and their cosine scores for a query."""
         if self.matrix is None:
             raise RuntimeError("Store not built. Call build() first.")
-        q_vec = np.array(self.client.embed([query])[0], dtype=np.float32)
+        q_vec = np.array(self.client.embed([query], input_type="query")[0], dtype=np.float32)
         q_vec /= np.linalg.norm(q_vec) or 1.0
         scores = self.matrix @ q_vec
         top = np.argsort(-scores)[:k]
@@ -191,27 +203,36 @@ def format_context(hits: list[tuple[Chunk, float]]) -> str:
     return "\n\n".join(lines)
 
 
-def answer(store: VectorStore, chat_client: LLMClient, question: str, k: int = TOP_K, stream: bool = True) -> str:
-    """Retrieve, build a cited prompt, and stream a grounded answer."""
-    hits = store.search(question, k=k)
+def answer(
+    store: VectorStore,
+    chat_client: LLMClient,
+    question: str,
+    k: int = TOP_K,
+    stream: bool = True,
+    hits: list[tuple[Chunk, float]] | None = None,
+) -> str:
+    """Retrieve (unless ``hits`` are given), build a cited prompt, and print a grounded answer."""
+    if hits is None:
+        hits = store.search(question, k=k)
     context = format_context(hits)
     messages = [{"role": "user", "content": PROMPT_TEMPLATE.format(context=context, question=question)}]
 
     console.print()
     parts: list[str] = []
+    # Model text is printed literally: brackets such as [1] or [/INST] are not Rich markup.
     if stream:
         for token in chat_client.stream(messages, temperature=0.2):
             parts.append(token)
-            console.print(token, end="")
+            console.print(token, end="", markup=False, highlight=False, emoji=False)
         console.print("\n")
     else:
         text = chat_client.chat(messages, temperature=0.2)
         parts.append(text)
-        console.print(text + "\n")
+        console.print(text + "\n", markup=False, highlight=False, emoji=False)
 
     console.print("[dim]Sources:[/dim]")
     for n, (chunk, score) in enumerate(hits, start=1):
-        console.print(f"  [dim][{n}] {chunk.doc}  (chunk {chunk.index}, score {score:.3f})[/dim]")
+        console.print(f"  [dim]{escape(f'[{n}] {chunk.doc}')}  (chunk {chunk.index}, score {score:.3f})[/dim]")
     return "".join(parts)
 
 
@@ -229,11 +250,11 @@ def cmd_ask(args) -> int:
     embed_client = LLMClient.create("ollama")
     chat_client = LLMClient.create(args.backend)
     store = VectorStore(embed_client).build(force=False)
-    hits = store.search(args.question, k=args.k)
+    hits = store.search(args.question, k=args.k)  # the question is embedded exactly once
     if args.show_context:
         console.print("[bold]Retrieved context[/bold]")
-        console.print(format_context(hits))
-    answer(store, chat_client, args.question, k=args.k, stream=not args.no_stream)
+        console.print(format_context(hits), markup=False, highlight=False)
+    answer(store, chat_client, args.question, k=args.k, stream=not args.no_stream, hits=hits)
     return 0
 
 
@@ -260,8 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except RuntimeError as exc:
-        console.print(f"[red]{exc}[/red]")
+    except (RuntimeError, ValueError, openai.APIError) as exc:
+        # RuntimeError covers MissingAPIKey; APIError covers "Ollama is not running".
+        console.print(f"[red]{escape(str(exc))}[/red]")
         return 1
 
 

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -43,9 +45,33 @@ KIT_ENV_VARS = (
     "OPENAI_API_KEY", "OPENAI_BASE_URL",
 )
 
-# Nothing listens on port 9 (discard) of the loopback interface: connections are refused fast.
-DEAD_OLLAMA = "http://127.0.0.1:9"
+# Nothing listens on port 9 (discard) of the loopback interface, so connecting is refused.
+# (On Windows a refused loopback connect takes ~2 s because of SYN retries.)
+REFUSED_OLLAMA = "http://127.0.0.1:9"
 TEST_NIM_KEY = "nvapi-test-key-0123456789abcdefghij"
+
+
+class HangUpServer:
+    """Accepts TCP connections and closes them at once: an 'unreachable' Ollama that fails fast."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(64)
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            conn.close()
+
+
+_HANG_UP = HangUpServer()
+DEAD_OLLAMA = _HANG_UP.url
 
 
 @pytest.fixture(autouse=True)
