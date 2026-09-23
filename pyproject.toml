@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollama-local-llm-kit"
+version = "0.2.0"
+description = "Run LLMs locally with Ollama, switch to NVIDIA NIM with one flag: model manager, local RAG, streaming REPL, GPU fit planner and benchmark."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Alejandro Brito" }]
+dependencies = [
+    "openai>=1.30.0",
+    "requests>=2.31.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.6.0",
+]
+
+[project.optional-dependencies]
+# Only examples/vision.py needs Pillow (to draw a sample image when none is given).
+examples = ["pillow>=10.2.0"]
+dev = ["pytest>=8.0", "pillow>=10.2.0"]
+
+[project.urls]
+Repository = "https://github.com/AleBrito124356/ollama-local-llm-kit"
+
+[tool.setuptools]
+# The kit is used from a clone as the `src` package (`python -m src.chat`,
+# `from src.client import LLMClient`). An editable install keeps that working
+# from any directory.
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
