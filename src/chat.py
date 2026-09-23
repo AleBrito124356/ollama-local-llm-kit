@@ -5,7 +5,7 @@ everything mid-conversation:
 
     /backend nim         switch to cloud NVIDIA NIM  (or  /backend ollama)
     /model qwen2.5:7b    switch the chat model on the current backend
-    /rag on | off        ground answers in sample_docs/ via the local RAG store
+    /rag on [PATH] | off ground answers in sample_docs/ (or PATH) via the local RAG store
     /models              list installed local models
     /system <text>       set the system prompt and reset history
     /reset               clear the conversation
@@ -16,6 +16,7 @@ Start it with:
     python -m src.chat
     python -m src.chat --backend nim
     python -m src.chat --rag
+    python -m src.chat --rag-docs ~/notes      # RAG over your own folder
 """
 
 from __future__ import annotations
@@ -33,7 +34,8 @@ HELP_TEXT = """\
 [bold]Commands[/bold]
   /backend <ollama|nim>   switch backend (cloud NIM needs NVIDIA_API_KEY)
   /model <name>           switch chat model on the current backend
-  /rag <on|off>           toggle local retrieval over sample_docs/
+  /rag on [PATH] | off    toggle local retrieval over sample_docs/ or PATH
+  /rag                    show the RAG status and the indexed folder
   /models                 list installed local models
   /system <text>          set system prompt and reset the conversation
   /reset                  clear conversation history
@@ -61,9 +63,10 @@ def print_error(prefix: str, exc: BaseException | str) -> None:
 class ChatSession:
     """Holds conversation state and the active client, and renders turns."""
 
-    def __init__(self, backend: str, system: str, rag: bool):
+    def __init__(self, backend: str, system: str, rag: bool, rag_docs: str | None = None):
         self.system = system
         self.rag = rag
+        self.rag_docs = rag_docs    # None = the bundled sample_docs/
         self.history: list[dict] = []
         self.rag_store = None       # lazily built VectorStore
         self.rag_embed_client = None
@@ -99,8 +102,15 @@ class ChatSession:
         from .rag_local import VectorStore
 
         self.rag_embed_client = LLMClient.create("ollama")
-        console.print("[dim]Building local RAG index ...[/dim]")
-        self.rag_store = VectorStore(self.rag_embed_client).build(force=False)
+        store = VectorStore(self.rag_embed_client, docs=self.rag_docs)
+        console.print(f"[dim]Indexing {escape(store.docs_root)} for RAG ...[/dim]")
+        self.rag_store = store.build(force=False)
+
+    def set_rag_docs(self, path: str | None) -> None:
+        """Point RAG at another folder; the index is (re)built on the next question."""
+        if path != self.rag_docs:
+            self.rag_docs = path
+            self.rag_store = None
 
     def _augment_with_rag(self, user_text: str) -> tuple[str, list]:
         """Return a context-grounded user message and the retrieved hits."""
@@ -151,7 +161,7 @@ class ChatSession:
         self.history.append({"role": "assistant", "content": reply})
 
         if hits:
-            names = ", ".join(f"[{i}] {c.doc}" for i, (c, _s) in enumerate(hits, start=1))
+            names = ", ".join(f"[{i}] {c.cite}" for i, (c, _s) in enumerate(hits, start=1))
             console.print(f"[dim]sources: {escape(names)}[/dim]")
 
 
@@ -174,11 +184,21 @@ def handle_command(session: ChatSession, line: str) -> bool:
         session.reset()
         console.print("[dim]System prompt set; conversation cleared.[/dim]")
     elif cmd == "/rag":
-        if arg.lower() in ("on", "off"):
-            session.rag = arg.lower() == "on"
-            console.print(f"[dim]RAG {'enabled' if session.rag else 'disabled'}.[/dim]")
+        words = arg.split(maxsplit=1)
+        mode = words[0].lower() if words else ""
+        if mode == "on":
+            if len(words) > 1:
+                session.set_rag_docs(words[1].strip().strip('"'))
+            session.rag = True
+            console.print(f"[dim]RAG enabled over {escape(session.rag_docs or 'sample_docs/')}.[/dim]")
+        elif mode == "off" and len(words) == 1:
+            session.rag = False
+            console.print("[dim]RAG disabled.[/dim]")
+        elif not mode:
+            state = "on" if session.rag else "off"
+            console.print(f"[dim]RAG is {state}; documents: {escape(session.rag_docs or 'sample_docs/')}[/dim]")
         else:
-            console.print("Usage: /rag on | off")
+            console.print("Usage: /rag on [PATH] | off")
     elif cmd == "/model":
         if arg:
             session.model_override = arg
@@ -233,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backend", default=None, help="ollama (default) or nim")
     parser.add_argument("--system", default="You are a helpful, concise assistant.", help="Initial system prompt")
     parser.add_argument("--rag", action="store_true", help="Start with local RAG enabled")
+    parser.add_argument("--rag-docs", default=None, metavar="PATH",
+                        help="Folder or file to ground answers in (implies --rag; default sample_docs/)")
     args = parser.parse_args(argv)
 
     try:
@@ -242,7 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        session = ChatSession(backend=backend, system=args.system, rag=args.rag)
+        session = ChatSession(backend=backend, system=args.system, rag=args.rag or bool(args.rag_docs),
+                              rag_docs=args.rag_docs)
     except MissingAPIKey as exc:
         print_error("", exc)
         return 1

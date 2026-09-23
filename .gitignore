@@ -12,7 +12,8 @@ dist/
 venv/
 env/
 
-# RAG vector cache (regenerated from sample_docs/)
+# RAG vector caches (one .npz per indexed corpus; regenerated on demand)
+.rag_cache/
 .rag_cache.npz
 
 # Test and tooling caches
