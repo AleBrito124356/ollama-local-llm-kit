@@ -155,3 +155,8 @@ def test_realtime_mode_makes_wall_clock_match_the_metrics(fake):
     assert r.decode_tps == pytest.approx(95.0, rel=1e-6)
     assert 50 < r.e2e_tps < 95  # 20 tokens at ~95 tok/s of wall time, plus a short prefill
     assert r.total_s >= 19 / 95
+
+
+def test_network_guard_also_applies_to_subprocesses(run_cli):
+    out = run_cli("-c", "import socket; socket.create_connection(('integrate.api.nvidia.com', 443), timeout=2)")
+    assert out.returncode != 0 and "blocked in tests" in out.stderr

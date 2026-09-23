@@ -52,7 +52,15 @@ from rich.table import Table
 
 from . import hardware as hw
 from .client import LLMClient, MissingAPIKey, ollama_host, resolve_model
-from .model_manager import OllamaError, check_server, gpu_share, list_models, running_models, show_model
+from .model_manager import (
+    OllamaError,
+    check_server,
+    gpu_share,
+    list_models,
+    running_models,
+    same_model,
+    show_model,
+)
 
 console = Console()
 
@@ -335,7 +343,7 @@ def benchmark_model(
         summary.error = f"{len(errors)} of {runs} runs failed: {errors[0]}"
     if backend == "ollama" and summary.ok_runs:
         try:
-            entry = next((m for m in running_models() if m.get("name") == model or m.get("model") == model), None)
+            entry = next((m for m in running_models() if same_model(m.get("name", ""), model)), None)
         except requests.RequestException:
             entry = None
         summary.gpu_percent = gpu_share(entry) if entry else None

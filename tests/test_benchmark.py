@@ -238,3 +238,10 @@ def test_nim_in_the_same_table(fake, fake_nim, capsys):
 
 def test_runs_must_be_positive(capsys):
     assert bm.main(["--runs", "0"]) == 2
+
+
+def test_gpu_share_matches_untagged_model_names(fake):
+    # Ollama resolves an untagged name to ":latest"; /api/ps then lists "llama3.1:latest".
+    s = bm.benchmark_model("ollama", "llama3.1", "p", 8, runs=1)
+    assert s.error is None and s.gpu_percent == 100.0
+    assert bm.same_model("llama3.1", "llama3.1:latest") and not bm.same_model("llama3.1:8b", "llama3.1:latest")

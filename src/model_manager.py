@@ -231,7 +231,8 @@ def gpu_share(entry: dict) -> float | None:
     return 100.0 * min(vram, size) / size
 
 
-def _same_model(a: str, b: str) -> bool:
+def same_model(a: str, b: str) -> bool:
+    """True if two model references name the same tag (``llama3.1`` == ``llama3.1:latest``)."""
     norm = lambda n: n if ":" in n else f"{n}:latest"  # noqa: E731
     return norm(a) == norm(b)
 
@@ -266,7 +267,7 @@ def catalog_specs(sections=("chat", "vision")) -> list[hw.ModelSpec]:
 
 def installed_spec(name: str) -> hw.ModelSpec | None:
     """ModelSpec for an installed model, from its /api/tags size and /api/show GGUF metadata."""
-    match = next((m for m in list_models() if _same_model(m.get("name", ""), name)), None)
+    match = next((m for m in list_models() if same_model(m.get("name", ""), name)), None)
     if match is None:
         return None
     info = show_model(match["name"])
@@ -462,7 +463,7 @@ def run_checks(online: bool = False, hardware: hw.Hardware | None = None) -> lis
         ]
         for role, label, missing_status, why in wanted:
             model = resolve_model(role, "ollama")
-            if any(_same_model(n, model) for n in names):
+            if any(same_model(n, model) for n in names):
                 add("ok", label, f"{model} installed")
             else:
                 add(missing_status, label,
